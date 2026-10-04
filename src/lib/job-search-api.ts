@@ -15,7 +15,7 @@ import {
   type MetricKey,
 } from "@/lib/job-search-data";
 
-// Loaded lazily so node:sqlite never enters a client bundle or jsdom test.
+// Loaded lazily so the database client never enters a client bundle or jsdom test.
 const store = () => import("@/server/job-search-db");
 
 const isoDate = (label: string) =>
@@ -100,13 +100,14 @@ async function guard<T>(run: () => T | Promise<T>): Promise<T> {
 
 export const fetchJobSearchData = createServerFn({ method: "GET" }).handler(async () => {
   const db = await store();
-  return {
-    settings: db.getSettings(),
-    demoAvailable: db.demoDataExists(),
-    entries: db.listEntries(),
-    opportunities: db.listOpportunities(),
-    companies: db.listCompanies(),
-  };
+  const [settings, demoAvailable, entries, opportunities, companies] = await Promise.all([
+    db.getSettings(),
+    db.demoDataExists(),
+    db.listEntries(),
+    db.listOpportunities(),
+    db.listCompanies(),
+  ]);
+  return { settings, demoAvailable, entries, opportunities, companies };
 });
 
 // Daily metrics
@@ -123,7 +124,7 @@ export const updateDailyEntry = createServerFn({ method: "POST" })
 export const deleteDailyEntry = createServerFn({ method: "POST" })
   .inputValidator(z.object({ id }))
   .handler(async ({ data }) => {
-    (await store()).deleteEntry(data.id);
+    await (await store()).deleteEntry(data.id);
     return data;
   });
 
@@ -141,7 +142,7 @@ export const updateOpportunity = createServerFn({ method: "POST" })
 export const deleteOpportunity = createServerFn({ method: "POST" })
   .inputValidator(z.object({ id }))
   .handler(async ({ data }) => {
-    (await store()).deleteOpportunity(data.id);
+    await (await store()).deleteOpportunity(data.id);
     return data;
   });
 
@@ -159,7 +160,7 @@ export const updateCompany = createServerFn({ method: "POST" })
 export const deleteCompany = createServerFn({ method: "POST" })
   .inputValidator(z.object({ id }))
   .handler(async ({ data }) => {
-    (await store()).deleteCompany(data.id);
+    await (await store()).deleteCompany(data.id);
     return data;
   });
 

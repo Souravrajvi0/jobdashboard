@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { Client, InArgs, InStatement } from "@libsql/client";
 import {
   advanceFurthest,
   applicationStatuses,
@@ -27,42 +27,66 @@ import {
 } from "@/lib/job-search-data";
 import { demoCompaniesFor, demoDailyEntries, demoOpportunitiesFor } from "@/server/demo-data";
 
-const DB_PATH =
+const LOCAL_DB_PATH =
   process.env["JOB_SEARCH_DB_PATH"] ?? path.join(process.cwd(), "data", "job-search.db");
+const DB_URL = process.env["TURSO_DATABASE_URL"] ?? `file:${LOCAL_DB_PATH.replace(/\\/g, "/")}`;
 
 export class UserFacingError extends Error {}
 
 type Row = Record<string, string | number | null>;
 
-let database: DatabaseSync | undefined;
+let database: Promise<Client> | undefined;
 
-function db(): DatabaseSync {
-  if (database) return database;
-  mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  database = new DatabaseSync(DB_PATH);
-  database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
-  migrate(database);
-  initialize(database);
+function db(): Promise<Client> {
+  database ??= connect().catch((error: unknown) => {
+    database = undefined;
+    throw error;
+  });
   return database;
+}
+
+async function connect(): Promise<Client> {
+  const isLocal = DB_URL.startsWith("file:");
+  // The web client is fetch-only, so serverless bundles never need libsql's native binary.
+  const { createClient } = isLocal
+    ? await import("@libsql/client")
+    : await import("@libsql/client/web");
+  if (isLocal) mkdirSync(path.dirname(LOCAL_DB_PATH), { recursive: true });
+  const authToken = process.env["TURSO_AUTH_TOKEN"];
+  const conn = createClient({ url: DB_URL, ...(authToken ? { authToken } : {}) });
+  if (isLocal) await conn.execute("PRAGMA journal_mode = WAL");
+  await migrate(conn);
+  await initialize(conn);
+  return conn;
+}
+
+async function get(conn: Client, sql: string, args: InArgs = []): Promise<Row | undefined> {
+  return (await conn.execute({ sql, args })).rows[0] as Row | undefined;
+}
+
+async function all(conn: Client, sql: string, args: InArgs = []): Promise<Row[]> {
+  return (await conn.execute({ sql, args })).rows as unknown as Row[];
+}
+
+async function run(conn: Client, sql: string, args: InArgs = []): Promise<number> {
+  return Number((await conn.execute({ sql, args })).lastInsertRowid ?? 0);
 }
 
 const metricColumnSql = (key: (typeof metricKeys)[number]) =>
   `${metricColumn(key)} INTEGER NOT NULL DEFAULT 0 CHECK (${metricColumn(key)} >= 0)`;
 
-function tableExists(conn: DatabaseSync, name: string): boolean {
-  return !!conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+async function tableExists(conn: Client, name: string): Promise<boolean> {
+  return !!(await get(conn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", [
+    name,
+  ]));
 }
 
-function columnsOf(conn: DatabaseSync, table: string): Set<string> {
-  return new Set(
-    (conn.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
-      (row) => row.name,
-    ),
-  );
+async function columnsOf(conn: Client, table: string): Promise<Set<string>> {
+  return new Set((await all(conn, `PRAGMA table_info(${table})`)).map((row) => String(row["name"])));
 }
 
-function migrate(conn: DatabaseSync) {
-  conn.exec(`
+async function migrate(conn: Client) {
+  await conn.executeMultiple(`
     CREATE TABLE IF NOT EXISTS daily_metrics (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       date TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
@@ -96,14 +120,14 @@ function migrate(conn: DatabaseSync) {
     );
   `);
 
-  const existingMetricColumns = columnsOf(conn, "daily_metrics");
+  const existingMetricColumns = await columnsOf(conn, "daily_metrics");
   for (const key of metricKeys) {
     if (!existingMetricColumns.has(metricColumn(key)))
-      conn.exec(`ALTER TABLE daily_metrics ADD COLUMN ${metricColumnSql(key)}`);
+      await conn.execute(`ALTER TABLE daily_metrics ADD COLUMN ${metricColumnSql(key)}`);
   }
 
   // Earlier versions stored daily data in daily_entries with shorter column names.
-  if (tableExists(conn, "daily_entries")) {
+  if (await tableExists(conn, "daily_entries")) {
     const legacy: Record<string, string> = {
       applications: "applications",
       referral_requests: "referral_requests",
@@ -123,21 +147,22 @@ function migrate(conn: DatabaseSync) {
       recruiter_inbound_calls: "inbound_calls",
       relevant_inbound_opportunities: "inbound_opportunities",
     };
-    const available = columnsOf(conn, "daily_entries");
+    const available = await columnsOf(conn, "daily_entries");
     const pairs = Object.entries(legacy).filter(([, from]) => available.has(from));
-    conn.exec(`
+    await conn.executeMultiple(`
       INSERT OR IGNORE INTO daily_metrics (date, notes, ${pairs.map(([to]) => to).join(", ")}, created_at, updated_at)
       SELECT date, notes, ${pairs.map(([, from]) => from).join(", ")}, created_at, updated_at FROM daily_entries;
       DROP TABLE daily_entries;
     `);
   }
 
-  const opportunityColumns = tableExists(conn, "opportunities")
-    ? columnsOf(conn, "opportunities")
+  const opportunityColumns = (await tableExists(conn, "opportunities"))
+    ? await columnsOf(conn, "opportunities")
     : new Set<string>();
   const legacyOpportunities = opportunityColumns.has("applied_on");
-  if (legacyOpportunities) conn.exec("ALTER TABLE opportunities RENAME TO opportunities_legacy");
-  conn.exec(`
+  if (legacyOpportunities)
+    await conn.execute("ALTER TABLE opportunities RENAME TO opportunities_legacy");
+  await conn.executeMultiple(`
     CREATE TABLE IF NOT EXISTS opportunities (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       company TEXT NOT NULL,
@@ -170,74 +195,76 @@ function migrate(conn: DatabaseSync) {
       Naukri: "Naukri Inbound",
       LinkedIn: "LinkedIn Inbound",
     };
-    const insert = conn.prepare(
-      "INSERT INTO opportunities (company, role, date, source, stage, furthest_stage, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    const inserts: InStatement[] = (await all(conn, "SELECT * FROM opportunities_legacy")).map(
+      (row) => {
+        const stage = stageMap[String(row["stage"])] ?? "Applied";
+        return {
+          sql: "INSERT INTO opportunities (company, role, date, source, stage, furthest_stage, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          args: [
+            String(row["company"]),
+            String(row["role"]),
+            String(row["applied_on"]),
+            sourceMap[String(row["source"])] ?? "Other",
+            stage,
+            advanceFurthest(null, stage === "Rejected" ? "Applied" : stage),
+            String(row["notes"] ?? ""),
+          ],
+        };
+      },
     );
-    for (const row of conn.prepare("SELECT * FROM opportunities_legacy").all() as Row[]) {
-      const stage = stageMap[String(row["stage"])] ?? "Applied";
-      insert.run(
-        String(row["company"]),
-        String(row["role"]),
-        String(row["applied_on"]),
-        sourceMap[String(row["source"])] ?? "Other",
-        stage,
-        advanceFurthest(null, stage === "Rejected" ? "Applied" : stage),
-        String(row["notes"] ?? ""),
-      );
-    }
-    conn.exec("DROP TABLE opportunities_legacy");
+    await conn.batch([...inserts, "DROP TABLE opportunities_legacy"], "write");
   }
 }
 
-function hasRealData(conn: DatabaseSync): boolean {
-  return ["daily_metrics", "opportunities", "companies"].some(
-    (table) => !!conn.prepare(`SELECT 1 FROM ${table} WHERE is_demo = 0 LIMIT 1`).get(),
-  );
+async function hasRealData(conn: Client): Promise<boolean> {
+  for (const table of ["daily_metrics", "opportunities", "companies"])
+    if (await get(conn, `SELECT 1 FROM ${table} WHERE is_demo = 0 LIMIT 1`)) return true;
+  return false;
 }
 
-function initialize(conn: DatabaseSync) {
-  if (readSetting(conn, "initialized")) return;
-  if (!hasRealData(conn)) {
-    seedDemo(conn);
-    writeSetting(conn, "dataset", "demo");
-  }
-  writeSetting(conn, "initialized", true);
+async function initialize(conn: Client) {
+  if (await readSetting(conn, "initialized")) return;
+  const statements: InStatement[] = [];
+  if (!(await hasRealData(conn)))
+    statements.push(...demoSeedStatements(), writeSettingStatement("dataset", "demo"));
+  statements.push(writeSettingStatement("initialized", true));
+  await conn.batch(statements, "write");
 }
 
 // ---------- Settings ----------
 
-function readSetting(conn: DatabaseSync, key: string): unknown {
-  const row = conn.prepare("SELECT value FROM settings WHERE key = ?").get(key) as
-    { value: string } | undefined;
-  return row ? JSON.parse(row.value) : undefined;
+async function readSetting(conn: Client, key: string): Promise<unknown> {
+  const row = await get(conn, "SELECT value FROM settings WHERE key = ?", [key]);
+  return row ? JSON.parse(String(row["value"])) : undefined;
 }
 
-function writeSetting(conn: DatabaseSync, key: string, value: unknown) {
-  conn
-    .prepare(
-      "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .run(key, JSON.stringify(value));
+const writeSettingStatement = (key: string, value: unknown): InStatement => ({
+  sql: "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  args: [key, JSON.stringify(value)],
+});
+
+async function writeSetting(conn: Client, key: string, value: unknown) {
+  await conn.execute(writeSettingStatement(key, value));
 }
 
-export function getSettings(): AppSettings {
-  const conn = db();
-  const dataset = readSetting(conn, "dataset") === "demo" ? "demo" : "real";
-  const stored = (readSetting(conn, "diagnostics") ?? {}) as Partial<DiagnosticSettings>;
+export async function getSettings(): Promise<AppSettings> {
+  const conn = await db();
+  const dataset = (await readSetting(conn, "dataset")) === "demo" ? "demo" : "real";
+  const stored = ((await readSetting(conn, "diagnostics")) ?? {}) as Partial<DiagnosticSettings>;
   return { dataset, diagnostics: { ...defaultDiagnosticSettings, ...stored } };
 }
 
-export function setDataset(dataset: Dataset): AppSettings {
-  writeSetting(db(), "dataset", dataset);
+export async function setDataset(dataset: Dataset): Promise<AppSettings> {
+  await writeSetting(await db(), "dataset", dataset);
   return getSettings();
 }
 
-export function setDiagnosticSettings(settings: DiagnosticSettings): AppSettings {
-  writeSetting(db(), "diagnostics", settings);
+export async function setDiagnosticSettings(settings: DiagnosticSettings): Promise<AppSettings> {
+  await writeSetting(await db(), "diagnostics", settings);
   return getSettings();
 }
 
-const demoFlag = () => (getSettings().dataset === "demo" ? 1 : 0);
+const demoFlag = async () => ((await getSettings()).dataset === "demo" ? 1 : 0);
 
 // ---------- Daily metrics ----------
 
@@ -254,58 +281,62 @@ function toEntry(row: Row): DailyEntry {
   };
 }
 
-export function listEntries(): DailyEntry[] {
+export async function listEntries(): Promise<DailyEntry[]> {
   return (
-    db()
-      .prepare("SELECT * FROM daily_metrics WHERE is_demo = ? ORDER BY date ASC")
-      .all(demoFlag()) as Row[]
+    await all(await db(), "SELECT * FROM daily_metrics WHERE is_demo = ? ORDER BY date ASC", [
+      await demoFlag(),
+    ])
   ).map(toEntry);
 }
 
-function entryById(id: number): DailyEntry {
-  return toEntry(db().prepare("SELECT * FROM daily_metrics WHERE id = ?").get(id) as Row);
+async function entryById(id: number): Promise<DailyEntry> {
+  return toEntry((await get(await db(), "SELECT * FROM daily_metrics WHERE id = ?", [id]))!);
 }
 
 const metricValues = (input: DailyEntryInput) => metricKeys.map((key) => input.metrics[key]);
 
-export function createEntry(input: DailyEntryInput): DailyEntry {
-  const conn = db();
-  const existing = conn
-    .prepare("SELECT id FROM daily_metrics WHERE date = ? AND is_demo = 0")
-    .get(input.date);
+export async function createEntry(input: DailyEntryInput): Promise<DailyEntry> {
+  const conn = await db();
+  const existing = await get(conn, "SELECT id FROM daily_metrics WHERE date = ? AND is_demo = 0", [
+    input.date,
+  ]);
   if (existing)
     throw new UserFacingError(
       `An entry for ${formatLongDate(input.date)} already exists. Open it to edit instead of creating a duplicate.`,
     );
   const columns = metricKeys.map(metricColumn);
-  const result = conn
-    .prepare(
-      `INSERT INTO daily_metrics (date, notes, ${columns.join(", ")}) VALUES (?, ?, ${columns.map(() => "?").join(", ")})`,
-    )
-    .run(input.date, input.notes, ...metricValues(input));
-  return entryById(Number(result.lastInsertRowid));
-}
-
-export function updateEntry(id: number, input: DailyEntryInput): DailyEntry {
-  const conn = db();
-  const current = conn.prepare("SELECT id FROM daily_metrics WHERE id = ? AND is_demo = 0").get(id);
-  if (!current) throw new UserFacingError("That entry no longer exists.");
-  const clash = conn
-    .prepare("SELECT id FROM daily_metrics WHERE date = ? AND is_demo = 0 AND id <> ?")
-    .get(input.date, id);
-  if (clash)
-    throw new UserFacingError(`Another entry already exists for ${formatLongDate(input.date)}.`);
-  const columns = metricKeys.map(metricColumn);
-  conn
-    .prepare(
-      `UPDATE daily_metrics SET date = ?, notes = ?, ${columns.map((name) => `${name} = ?`).join(", ")}, updated_at = datetime('now') WHERE id = ?`,
-    )
-    .run(input.date, input.notes, ...metricValues(input), id);
+  const id = await run(
+    conn,
+    `INSERT INTO daily_metrics (date, notes, ${columns.join(", ")}) VALUES (?, ?, ${columns.map(() => "?").join(", ")})`,
+    [input.date, input.notes, ...metricValues(input)],
+  );
   return entryById(id);
 }
 
-export function deleteEntry(id: number): void {
-  db().prepare("DELETE FROM daily_metrics WHERE id = ? AND is_demo = 0").run(id);
+export async function updateEntry(id: number, input: DailyEntryInput): Promise<DailyEntry> {
+  const conn = await db();
+  const current = await get(conn, "SELECT id FROM daily_metrics WHERE id = ? AND is_demo = 0", [
+    id,
+  ]);
+  if (!current) throw new UserFacingError("That entry no longer exists.");
+  const clash = await get(
+    conn,
+    "SELECT id FROM daily_metrics WHERE date = ? AND is_demo = 0 AND id <> ?",
+    [input.date, id],
+  );
+  if (clash)
+    throw new UserFacingError(`Another entry already exists for ${formatLongDate(input.date)}.`);
+  const columns = metricKeys.map(metricColumn);
+  await run(
+    conn,
+    `UPDATE daily_metrics SET date = ?, notes = ?, ${columns.map((name) => `${name} = ?`).join(", ")}, updated_at = datetime('now') WHERE id = ?`,
+    [input.date, input.notes, ...metricValues(input), id],
+  );
+  return entryById(id);
+}
+
+export async function deleteEntry(id: number): Promise<void> {
+  await run(await db(), "DELETE FROM daily_metrics WHERE id = ? AND is_demo = 0", [id]);
 }
 
 // ---------- Opportunities ----------
@@ -333,26 +364,28 @@ function toOpportunity(row: Row): Opportunity {
   };
 }
 
-export function listOpportunities(): Opportunity[] {
+export async function listOpportunities(): Promise<Opportunity[]> {
   return (
-    db()
-      .prepare("SELECT * FROM opportunities WHERE is_demo = ? ORDER BY date DESC, id DESC")
-      .all(demoFlag()) as Row[]
+    await all(
+      await db(),
+      "SELECT * FROM opportunities WHERE is_demo = ? ORDER BY date DESC, id DESC",
+      [await demoFlag()],
+    )
   ).map(toOpportunity);
 }
 
-function opportunityById(id: number): Opportunity | null {
-  const row = db().prepare("SELECT * FROM opportunities WHERE id = ? AND is_demo = 0").get(id) as
-    Row | undefined;
+async function opportunityById(id: number): Promise<Opportunity | null> {
+  const row = await get(await db(), "SELECT * FROM opportunities WHERE id = ? AND is_demo = 0", [
+    id,
+  ]);
   return row ? toOpportunity(row) : null;
 }
 
-export function createOpportunity(input: OpportunityInput): Opportunity {
-  const result = db()
-    .prepare(
-      "INSERT INTO opportunities (company, role, date, source, stage, furthest_stage, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .run(
+export async function createOpportunity(input: OpportunityInput): Promise<Opportunity> {
+  const id = await run(
+    await db(),
+    "INSERT INTO opportunities (company, role, date, source, stage, furthest_stage, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [
       input.company,
       input.role,
       input.date,
@@ -360,18 +393,18 @@ export function createOpportunity(input: OpportunityInput): Opportunity {
       input.stage,
       advanceFurthest(null, input.stage),
       input.notes,
-    );
-  return opportunityById(Number(result.lastInsertRowid))!;
+    ],
+  );
+  return (await opportunityById(id))!;
 }
 
-export function updateOpportunity(id: number, input: OpportunityInput): Opportunity {
-  const existing = opportunityById(id);
+export async function updateOpportunity(id: number, input: OpportunityInput): Promise<Opportunity> {
+  const existing = await opportunityById(id);
   if (!existing) throw new UserFacingError("That opportunity no longer exists.");
-  db()
-    .prepare(
-      "UPDATE opportunities SET company = ?, role = ?, date = ?, source = ?, stage = ?, furthest_stage = ?, notes = ?, updated_at = datetime('now') WHERE id = ?",
-    )
-    .run(
+  await run(
+    await db(),
+    "UPDATE opportunities SET company = ?, role = ?, date = ?, source = ?, stage = ?, furthest_stage = ?, notes = ?, updated_at = datetime('now') WHERE id = ?",
+    [
       input.company,
       input.role,
       input.date,
@@ -380,12 +413,13 @@ export function updateOpportunity(id: number, input: OpportunityInput): Opportun
       advanceFurthest(existing.furthestStage, input.stage),
       input.notes,
       id,
-    );
-  return opportunityById(id)!;
+    ],
+  );
+  return (await opportunityById(id))!;
 }
 
-export function deleteOpportunity(id: number): void {
-  db().prepare("DELETE FROM opportunities WHERE id = ? AND is_demo = 0").run(id);
+export async function deleteOpportunity(id: number): Promise<void> {
+  await run(await db(), "DELETE FROM opportunities WHERE id = ? AND is_demo = 0", [id]);
 }
 
 // ---------- Companies ----------
@@ -411,17 +445,18 @@ function toCompany(row: Row): Company {
   };
 }
 
-export function listCompanies(): Company[] {
+export async function listCompanies(): Promise<Company[]> {
   return (
-    db()
-      .prepare("SELECT * FROM companies WHERE is_demo = ? ORDER BY name COLLATE NOCASE")
-      .all(demoFlag()) as Row[]
+    await all(
+      await db(),
+      "SELECT * FROM companies WHERE is_demo = ? ORDER BY name COLLATE NOCASE",
+      [await demoFlag()],
+    )
   ).map(toCompany);
 }
 
-function companyById(id: number): Company | null {
-  const row = db().prepare("SELECT * FROM companies WHERE id = ? AND is_demo = 0").get(id) as
-    Row | undefined;
+async function companyById(id: number): Promise<Company | null> {
+  const row = await get(await db(), "SELECT * FROM companies WHERE id = ? AND is_demo = 0", [id]);
   return row ? toCompany(row) : null;
 }
 
@@ -439,76 +474,81 @@ const companyValues = (input: CompanyInput) => [
   input.notes,
 ];
 
-export function createCompany(input: CompanyInput, isDemo = false, conn = db()): Company | null {
-  const result = conn
-    .prepare(
-      "INSERT INTO companies (name, target_role, job_url, source, contact_available, referral_available, application_status, current_stage, last_activity, next_follow_up, notes, is_demo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .run(...companyValues(input), isDemo ? 1 : 0);
-  return isDemo ? null : companyById(Number(result.lastInsertRowid));
+const insertCompanyStatement = (input: CompanyInput, isDemo: boolean): InStatement => ({
+  sql: "INSERT INTO companies (name, target_role, job_url, source, contact_available, referral_available, application_status, current_stage, last_activity, next_follow_up, notes, is_demo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  args: [...companyValues(input), isDemo ? 1 : 0],
+});
+
+export async function createCompany(input: CompanyInput): Promise<Company> {
+  const result = await (await db()).execute(insertCompanyStatement(input, false));
+  return (await companyById(Number(result.lastInsertRowid)))!;
 }
 
-export function updateCompany(id: number, input: CompanyInput): Company {
-  if (!companyById(id)) throw new UserFacingError("That company no longer exists.");
-  db()
-    .prepare(
-      "UPDATE companies SET name = ?, target_role = ?, job_url = ?, source = ?, contact_available = ?, referral_available = ?, application_status = ?, current_stage = ?, last_activity = ?, next_follow_up = ?, notes = ?, updated_at = datetime('now') WHERE id = ?",
-    )
-    .run(...companyValues(input), id);
-  return companyById(id)!;
+export async function updateCompany(id: number, input: CompanyInput): Promise<Company> {
+  if (!(await companyById(id))) throw new UserFacingError("That company no longer exists.");
+  await run(
+    await db(),
+    "UPDATE companies SET name = ?, target_role = ?, job_url = ?, source = ?, contact_available = ?, referral_available = ?, application_status = ?, current_stage = ?, last_activity = ?, next_follow_up = ?, notes = ?, updated_at = datetime('now') WHERE id = ?",
+    [...companyValues(input), id],
+  );
+  return (await companyById(id))!;
 }
 
-export function deleteCompany(id: number): void {
-  db().prepare("DELETE FROM companies WHERE id = ? AND is_demo = 0").run(id);
+export async function deleteCompany(id: number): Promise<void> {
+  await run(await db(), "DELETE FROM companies WHERE id = ? AND is_demo = 0", [id]);
 }
 
 // ---------- Demo data ----------
 
-function seedDemo(conn: DatabaseSync) {
+const deleteDemoStatements = [
+  "DELETE FROM daily_metrics WHERE is_demo = 1",
+  "DELETE FROM opportunities WHERE is_demo = 1",
+  "DELETE FROM companies WHERE is_demo = 1",
+];
+
+function demoSeedStatements(): InStatement[] {
   const today = todayISO();
   const columns = metricKeys.map(metricColumn);
-  const insertEntry = conn.prepare(
-    `INSERT OR REPLACE INTO daily_metrics (date, notes, is_demo, ${columns.join(", ")}) VALUES (?, ?, 1, ${columns.map(() => "?").join(", ")})`,
-  );
-  for (const entry of demoDailyEntries(today))
-    insertEntry.run(entry.date, entry.notes, ...metricValues(entry));
-  const insertOpportunity = conn.prepare(
-    "INSERT INTO opportunities (company, role, date, source, stage, furthest_stage, notes, is_demo) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-  );
-  for (const item of demoOpportunitiesFor(today))
-    insertOpportunity.run(
-      item.company,
-      item.role,
-      item.date,
-      item.source,
-      item.stage,
-      item.furthestStage,
-      item.notes,
-    );
-  for (const company of demoCompaniesFor(today)) createCompany(company, true, conn);
+  const entrySql = `INSERT OR REPLACE INTO daily_metrics (date, notes, is_demo, ${columns.join(", ")}) VALUES (?, ?, 1, ${columns.map(() => "?").join(", ")})`;
+  const opportunitySql =
+    "INSERT INTO opportunities (company, role, date, source, stage, furthest_stage, notes, is_demo) VALUES (?, ?, ?, ?, ?, ?, ?, 1)";
+  return [
+    ...demoDailyEntries(today).map((entry) => ({
+      sql: entrySql,
+      args: [entry.date, entry.notes, ...metricValues(entry)],
+    })),
+    ...demoOpportunitiesFor(today).map((item) => ({
+      sql: opportunitySql,
+      args: [
+        item.company,
+        item.role,
+        item.date,
+        item.source,
+        item.stage,
+        item.furthestStage,
+        item.notes,
+      ],
+    })),
+    ...demoCompaniesFor(today).map((company) => insertCompanyStatement(company, true)),
+  ];
 }
 
-export function clearDemoData(): AppSettings {
-  const conn = db();
-  conn.exec(
-    "DELETE FROM daily_metrics WHERE is_demo = 1; DELETE FROM opportunities WHERE is_demo = 1; DELETE FROM companies WHERE is_demo = 1;",
-  );
-  writeSetting(conn, "dataset", "real");
+export async function clearDemoData(): Promise<AppSettings> {
+  await (await db()).batch([...deleteDemoStatements, writeSettingStatement("dataset", "real")], "write");
   return getSettings();
 }
 
-export function reloadDemoData(): AppSettings {
-  const conn = db();
-  conn.exec(
-    "DELETE FROM daily_metrics WHERE is_demo = 1; DELETE FROM opportunities WHERE is_demo = 1; DELETE FROM companies WHERE is_demo = 1;",
+export async function reloadDemoData(): Promise<AppSettings> {
+  await (await db()).batch(
+    [...deleteDemoStatements, ...demoSeedStatements(), writeSettingStatement("dataset", "demo")],
+    "write",
   );
-  seedDemo(conn);
-  writeSetting(conn, "dataset", "demo");
   return getSettings();
 }
 
-export function demoDataExists(): boolean {
-  return ["daily_metrics", "opportunities", "companies"].some(
-    (table) => !!db().prepare(`SELECT 1 FROM ${table} WHERE is_demo = 1 LIMIT 1`).get(),
-  );
+export async function demoDataExists(): Promise<boolean> {
+  const conn = await db();
+  for (const table of ["daily_metrics", "opportunities", "companies"])
+    if (await get(conn, `SELECT 1 FROM ${table} WHERE is_demo = 1 LIMIT 1`)) return true;
+  return false;
 }

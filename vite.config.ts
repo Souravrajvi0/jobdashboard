@@ -18,8 +18,10 @@ export default defineConfig(({ command }) => ({
       server: { entry: "server" },
       importProtection: { behavior: "error", client: { files: ["**/server/**"] } },
     }),
-    // node-server preset: the app uses node:sqlite, so it must run on Node, not an edge runtime.
-    ...(command === "build" ? [nitro({ preset: "node-server" })] : []),
+    // Netlify sets NETLIFY=true during its builds; local builds stay a plain Node server.
+    ...(command === "build"
+      ? [nitro({ preset: process.env["NETLIFY"] ? "netlify" : "node-server" })]
+      : []),
     viteReact(),
   ],
 }));

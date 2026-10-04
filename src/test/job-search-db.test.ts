@@ -9,42 +9,46 @@ type Store = typeof import("@/server/job-search-db");
 let store: Store;
 
 beforeAll(async () => {
+  delete process.env["TURSO_DATABASE_URL"];
   process.env["JOB_SEARCH_DB_PATH"] = path.join(
     mkdtempSync(path.join(tmpdir(), "job-search-")),
     "test.db",
   );
   store = await import("@/server/job-search-db");
-});
+  await store.getSettings();
+}, 60_000);
 
 describe("job search database", () => {
-  it("starts on clearly separated demo data", () => {
-    expect(store.getSettings().dataset).toBe("demo");
-    expect(store.demoDataExists()).toBe(true);
-    expect(store.listEntries().every((entry) => entry.notes.startsWith("[Demo]"))).toBe(true);
+  it("starts on clearly separated demo data", async () => {
+    expect((await store.getSettings()).dataset).toBe("demo");
+    expect(await store.demoDataExists()).toBe(true);
+    expect((await store.listEntries()).every((entry) => entry.notes.startsWith("[Demo]"))).toBe(
+      true,
+    );
   });
 
-  it("keeps real entries separate and rejects duplicate dates", () => {
-    store.setDataset("real");
-    expect(store.listEntries()).toHaveLength(0);
-    const created = store.createEntry({
+  it("keeps real entries separate and rejects duplicate dates", async () => {
+    await store.setDataset("real");
+    expect(await store.listEntries()).toHaveLength(0);
+    const created = await store.createEntry({
       date: "2026-10-01",
       notes: "",
       metrics: { ...emptyMetrics(), applications: 5 },
     });
-    expect(() =>
+    await expect(
       store.createEntry({ date: "2026-10-01", notes: "", metrics: emptyMetrics() }),
-    ).toThrow(store.UserFacingError);
-    const updated = store.updateEntry(created.id, {
+    ).rejects.toThrow(store.UserFacingError);
+    const updated = await store.updateEntry(created.id, {
       date: "2026-10-01",
       notes: "edited",
       metrics: { ...emptyMetrics(), applications: 7 },
     });
     expect(updated.metrics.applications).toBe(7);
-    expect(store.listEntries()).toHaveLength(1);
+    expect(await store.listEntries()).toHaveLength(1);
   });
 
-  it("tracks the furthest opportunity stage", () => {
-    const opportunity = store.createOpportunity({
+  it("tracks the furthest opportunity stage", async () => {
+    const opportunity = await store.createOpportunity({
       company: "Acme",
       role: "SDE",
       date: "2026-10-01",
@@ -52,7 +56,7 @@ describe("job search database", () => {
       stage: "Technical Interview",
       notes: "",
     });
-    const rejected = store.updateOpportunity(opportunity.id, {
+    const rejected = await store.updateOpportunity(opportunity.id, {
       company: "Acme",
       role: "SDE",
       date: "2026-10-01",
@@ -63,8 +67,8 @@ describe("job search database", () => {
     expect(rejected).toMatchObject({ stage: "Rejected", furthestStage: "Technical Interview" });
   });
 
-  it("supports company CRUD", () => {
-    const company = store.createCompany({
+  it("supports company CRUD", async () => {
+    const company = await store.createCompany({
       name: "Globex",
       targetRole: "Backend",
       jobUrl: "",
@@ -77,15 +81,15 @@ describe("job search database", () => {
       nextFollowUp: null,
       notes: "",
     });
-    expect(company?.name).toBe("Globex");
-    store.deleteCompany(company!.id);
-    expect(store.listCompanies()).toHaveLength(0);
+    expect(company.name).toBe("Globex");
+    await store.deleteCompany(company.id);
+    expect(await store.listCompanies()).toHaveLength(0);
   });
 
-  it("deletes demo data without touching real data", () => {
-    store.clearDemoData();
-    expect(store.demoDataExists()).toBe(false);
-    expect(store.getSettings().dataset).toBe("real");
-    expect(store.listEntries()).toHaveLength(1);
+  it("deletes demo data without touching real data", async () => {
+    await store.clearDemoData();
+    expect(await store.demoDataExists()).toBe(false);
+    expect((await store.getSettings()).dataset).toBe("real");
+    expect(await store.listEntries()).toHaveLength(1);
   });
 });

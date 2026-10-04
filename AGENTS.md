@@ -1,3 +1,3 @@
 - Job-search analytics dashboard built with TanStack Start. Screens are file-based routes under `src/routes`; UI lives in `src/components/job-search-ui.tsx`.
-- Data is persisted in a local SQLite database (`data/job-search.db`, via `node:sqlite`) behind server functions in `src/lib/job-search-api.ts`. Requires Node 22+.
+- Data is persisted via `@libsql/client` in `src/server/job-search-db.ts` (Turso when `TURSO_DATABASE_URL` is set, otherwise the local file `data/job-search.db`) behind server functions in `src/lib/job-search-api.ts`. All DB functions are async. Requires Node 22+.
 - All conversion rates and weekly insights are derived from daily entries in `src/lib/job-search-data.ts`; never store or accept computed rates as input.

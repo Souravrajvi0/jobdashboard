@@ -19,8 +19,9 @@ dist-ssr
 # Local SQLite database (personal job-search data)
 data/
 
-# Netlify local build output
+# Netlify local build output and deploy archives
 .netlify/
+deploy-*.zip
 
 # Wrangler / Cloudflare
 .wrangler/

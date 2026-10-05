@@ -44,6 +44,14 @@ describe("job search database", () => {
       metrics: { ...emptyMetrics(), applications: 7 },
     });
     expect(updated.metrics.applications).toBe(7);
+    expect(updated.naukri).toEqual({ python: false, java: false, node: false });
+    const checked = await store.updateEntry(created.id, {
+      date: "2026-10-01",
+      notes: "edited",
+      metrics: { ...emptyMetrics(), applications: 7 },
+      naukri: { python: true, java: false, node: true },
+    });
+    expect(checked.naukri).toEqual({ python: true, java: false, node: true });
     expect(await store.listEntries()).toHaveLength(1);
   });
 

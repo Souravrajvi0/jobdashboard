@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { ChevronLeft, ChevronRight, Minus, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   DemoReadOnlyNotice,
   FormError,
@@ -14,6 +15,7 @@ import { useJobSearch } from "@/lib/job-search-context";
 import {
   addDays,
   derive,
+  emptyNaukriChecks,
   formatLongDate,
   formatShortDate,
   isValidISODate,
@@ -21,10 +23,17 @@ import {
   metricGroups,
   metricKeys,
   metricLabels,
+  naukriProfileKeys,
+  naukriProfiles,
   startOfWeek,
   type MetricKey,
   type MetricValues,
+  type NaukriChecks,
+  type NaukriProfile,
 } from "@/lib/job-search-data";
+
+const naukriDone = (checks?: NaukriChecks) =>
+  checks ? naukriProfileKeys.filter((key) => checks[key]).length : 0;
 
 type FormValues = Record<MetricKey, string>;
 
@@ -117,6 +126,7 @@ export function DailyEntryPage({ initialDate }: { initialDate?: string | undefin
   const existing = entriesByDate.get(date);
   const [values, setValues] = useState<FormValues>(() => toForm(existing?.metrics));
   const [notes, setNotes] = useState(existing?.notes ?? "");
+  const [naukri, setNaukri] = useState<NaukriChecks>(existing?.naukri ?? emptyNaukriChecks());
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -125,6 +135,7 @@ export function DailyEntryPage({ initialDate }: { initialDate?: string | undefin
   useEffect(() => {
     setValues(toForm(existing?.metrics));
     setNotes(existing?.notes ?? "");
+    setNaukri(existing?.naukri ?? emptyNaukriChecks());
     setDirty(false);
     setError(null);
     // reset only when switching to a different saved row or date
@@ -163,6 +174,12 @@ export function DailyEntryPage({ initialDate }: { initialDate?: string | undefin
     setSaved(null);
   };
 
+  const toggleNaukri = (profile: NaukriProfile, checked: boolean) => {
+    setNaukri((current) => ({ ...current, [profile]: checked }));
+    setDirty(true);
+    setSaved(null);
+  };
+
   const save = async () => {
     if (hasErrors || busy || readOnly) {
       if (hasErrors) setError(dateError ?? "Fix the highlighted fields before saving.");
@@ -171,7 +188,7 @@ export function DailyEntryPage({ initialDate }: { initialDate?: string | undefin
     setBusy(true);
     setError(null);
     try {
-      await saveEntry({ date, notes: notes.trim(), metrics }, existing?.id);
+      await saveEntry({ date, notes: notes.trim(), metrics, naukri }, existing?.id);
       setDirty(false);
       setSaved(existing ? "Changes saved." : "Entry saved.");
     } catch (caught) {
@@ -280,6 +297,26 @@ export function DailyEntryPage({ initialDate }: { initialDate?: string | undefin
         </p>
       )}
 
+      <Panel title="Naukri" eyebrow={`Applied today · ${naukriDone(naukri)}/3`}>
+        <div className="flex flex-wrap gap-x-6 gap-y-2">
+          {naukriProfiles.map((profile) => (
+            <label
+              key={profile.key}
+              htmlFor={`naukri-${profile.key}`}
+              className="flex cursor-pointer items-center gap-2 text-sm"
+            >
+              <Checkbox
+                id={`naukri-${profile.key}`}
+                checked={naukri[profile.key]}
+                disabled={readOnly}
+                onCheckedChange={(checked) => toggleNaukri(profile.key, checked === true)}
+              />
+              {profile.label}
+            </label>
+          ))}
+        </div>
+      </Panel>
+
       <div className="grid gap-4 lg:grid-cols-3">
         {metricGroups.map((group) => (
           <Panel key={group.id} title={group.title} eyebrow={group.subtitle}>
@@ -369,7 +406,8 @@ export function DailyEntryPage({ initialDate }: { initialDate?: string | undefin
                   <span>{formatLongDate(entry.date)}</span>
                   <span className="font-mono text-[11px] text-muted-foreground">
                     {totals.applications} apps · {totals.outreach} outreach · {totals.responses}{" "}
-                    responses · {totals.interviews} interviews · {totals.profileViews} views
+                    responses · {totals.interviews} interviews · {totals.profileViews} views ·
+                    Naukri {naukriDone(entry.naukri)}/3
                   </span>
                 </button>
               );

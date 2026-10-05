@@ -66,11 +66,28 @@ export function emptyMetrics(): MetricValues {
   return Object.fromEntries(metricKeys.map((key) => [key, 0])) as MetricValues;
 }
 
+/** Naukri profiles to apply from each day. */
+export const naukriProfiles = [
+  { key: "python", label: "Naukri Python" },
+  { key: "java", label: "Naukri Java" },
+  { key: "node", label: "Naukri Node" },
+] as const;
+
+export type NaukriProfile = (typeof naukriProfiles)[number]["key"];
+export type NaukriChecks = Record<NaukriProfile, boolean>;
+
+export const naukriProfileKeys = naukriProfiles.map((profile) => profile.key) as NaukriProfile[];
+
+export function emptyNaukriChecks(): NaukriChecks {
+  return { python: false, java: false, node: false };
+}
+
 export interface DailyEntry {
   id: number;
   date: string;
   notes: string;
   metrics: MetricValues;
+  naukri?: NaukriChecks;
   createdAt: string;
   updatedAt: string;
 }
@@ -79,6 +96,7 @@ export interface DailyEntryInput {
   date: string;
   notes: string;
   metrics: MetricValues;
+  naukri?: NaukriChecks;
 }
 
 // ---------- Derived values ----------

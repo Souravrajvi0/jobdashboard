@@ -4,15 +4,18 @@ import {
   addDays,
   applicationStatuses,
   diagnosticSettingFields,
+  emptyNaukriChecks,
   isValidISODate,
   MAX_DAILY_COUNT,
   metricKeys,
   metricLabels,
+  naukriProfileKeys,
   opportunitySources,
   pipelineStages,
   todayISO,
   type DiagnosticSettings,
   type MetricKey,
+  type NaukriProfile,
 } from "@/lib/job-search-data";
 
 // Loaded lazily so the database client never enters a client bundle or jsdom test.
@@ -48,6 +51,14 @@ const entrySchema = z.object({
   date: pastOrToday("Date"),
   notes: z.string().trim().max(1000, "Notes must be under 1000 characters."),
   metrics: metricsSchema,
+  naukri: z
+    .object(
+      Object.fromEntries(naukriProfileKeys.map((key) => [key, z.boolean()])) as Record<
+        NaukriProfile,
+        z.ZodBoolean
+      >,
+    )
+    .default(emptyNaukriChecks()),
 });
 
 const opportunitySchema = z.object({

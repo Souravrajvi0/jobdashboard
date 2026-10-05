@@ -9,6 +9,7 @@ import {
   formatLongDate,
   metricColumn,
   metricKeys,
+  naukriProfileKeys,
   opportunitySources,
   pipelineStages,
   todayISO,
@@ -20,6 +21,8 @@ import {
   type DailyEntryInput,
   type Dataset,
   type DiagnosticSettings,
+  type NaukriChecks,
+  type NaukriProfile,
   type Opportunity,
   type OpportunityInput,
   type OpportunitySource,
@@ -72,6 +75,8 @@ async function run(conn: Client, sql: string, args: InArgs = []): Promise<number
   return Number((await conn.execute({ sql, args })).lastInsertRowid ?? 0);
 }
 
+const naukriColumn = (profile: NaukriProfile) => `naukri_${profile}`;
+
 const metricColumnSql = (key: (typeof metricKeys)[number]) =>
   `${metricColumn(key)} INTEGER NOT NULL DEFAULT 0 CHECK (${metricColumn(key)} >= 0)`;
 
@@ -82,7 +87,9 @@ async function tableExists(conn: Client, name: string): Promise<boolean> {
 }
 
 async function columnsOf(conn: Client, table: string): Promise<Set<string>> {
-  return new Set((await all(conn, `PRAGMA table_info(${table})`)).map((row) => String(row["name"])));
+  return new Set(
+    (await all(conn, `PRAGMA table_info(${table})`)).map((row) => String(row["name"])),
+  );
 }
 
 async function migrate(conn: Client) {
@@ -124,6 +131,12 @@ async function migrate(conn: Client) {
   for (const key of metricKeys) {
     if (!existingMetricColumns.has(metricColumn(key)))
       await conn.execute(`ALTER TABLE daily_metrics ADD COLUMN ${metricColumnSql(key)}`);
+  }
+  for (const profile of naukriProfileKeys) {
+    if (!existingMetricColumns.has(naukriColumn(profile)))
+      await conn.execute(
+        `ALTER TABLE daily_metrics ADD COLUMN ${naukriColumn(profile)} INTEGER NOT NULL DEFAULT 0`,
+      );
   }
 
   // Earlier versions stored daily data in daily_entries with shorter column names.
@@ -271,11 +284,15 @@ const demoFlag = async () => ((await getSettings()).dataset === "demo" ? 1 : 0);
 function toEntry(row: Row): DailyEntry {
   const metrics = emptyMetrics();
   for (const key of metricKeys) metrics[key] = Number(row[metricColumn(key)] ?? 0);
+  const naukri = Object.fromEntries(
+    naukriProfileKeys.map((profile) => [profile, Number(row[naukriColumn(profile)] ?? 0) === 1]),
+  ) as NaukriChecks;
   return {
     id: Number(row["id"]),
     date: String(row["date"]),
     notes: String(row["notes"] ?? ""),
     metrics,
+    naukri,
     createdAt: String(row["created_at"]),
     updatedAt: String(row["updated_at"]),
   };
@@ -294,6 +311,9 @@ async function entryById(id: number): Promise<DailyEntry> {
 }
 
 const metricValues = (input: DailyEntryInput) => metricKeys.map((key) => input.metrics[key]);
+const naukriColumns = naukriProfileKeys.map(naukriColumn);
+const naukriValues = (input: DailyEntryInput) =>
+  naukriProfileKeys.map((profile) => (input.naukri?.[profile] ? 1 : 0));
 
 export async function createEntry(input: DailyEntryInput): Promise<DailyEntry> {
   const conn = await db();
@@ -304,11 +324,11 @@ export async function createEntry(input: DailyEntryInput): Promise<DailyEntry> {
     throw new UserFacingError(
       `An entry for ${formatLongDate(input.date)} already exists. Open it to edit instead of creating a duplicate.`,
     );
-  const columns = metricKeys.map(metricColumn);
+  const columns = [...metricKeys.map(metricColumn), ...naukriColumns];
   const id = await run(
     conn,
     `INSERT INTO daily_metrics (date, notes, ${columns.join(", ")}) VALUES (?, ?, ${columns.map(() => "?").join(", ")})`,
-    [input.date, input.notes, ...metricValues(input)],
+    [input.date, input.notes, ...metricValues(input), ...naukriValues(input)],
   );
   return entryById(id);
 }
@@ -326,11 +346,11 @@ export async function updateEntry(id: number, input: DailyEntryInput): Promise<D
   );
   if (clash)
     throw new UserFacingError(`Another entry already exists for ${formatLongDate(input.date)}.`);
-  const columns = metricKeys.map(metricColumn);
+  const columns = [...metricKeys.map(metricColumn), ...naukriColumns];
   await run(
     conn,
     `UPDATE daily_metrics SET date = ?, notes = ?, ${columns.map((name) => `${name} = ?`).join(", ")}, updated_at = datetime('now') WHERE id = ?`,
-    [input.date, input.notes, ...metricValues(input), id],
+    [input.date, input.notes, ...metricValues(input), ...naukriValues(input), id],
   );
   return entryById(id);
 }
@@ -534,12 +554,16 @@ function demoSeedStatements(): InStatement[] {
 }
 
 export async function clearDemoData(): Promise<AppSettings> {
-  await (await db()).batch([...deleteDemoStatements, writeSettingStatement("dataset", "real")], "write");
+  await (
+    await db()
+  ).batch([...deleteDemoStatements, writeSettingStatement("dataset", "real")], "write");
   return getSettings();
 }
 
 export async function reloadDemoData(): Promise<AppSettings> {
-  await (await db()).batch(
+  await (
+    await db()
+  ).batch(
     [...deleteDemoStatements, ...demoSeedStatements(), writeSettingStatement("dataset", "demo")],
     "write",
   );
